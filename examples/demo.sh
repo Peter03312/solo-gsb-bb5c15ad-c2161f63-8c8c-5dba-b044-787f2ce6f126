@@ -19,12 +19,14 @@ step "1. 登记原料批次（含过敏原 / 待确认）"
 req POST /materials '{"batch_id":"RM-MILK","allergens":["milk"],"declared_at":"2026-01-02T06:00:00Z"}'
 req POST /materials '{"batch_id":"RM-OAT","allergens":["gluten"],"declared_at":"2026-01-02T06:00:00Z"}'
 req POST /materials '{"batch_id":"RM-MYST","pending":true,"declared_at":"2026-01-02T06:00:00Z"}'
+# 另登记一个“误登”原料，第 8b 步用投入纠正把 P2 改回正确列表
+req POST /materials '{"batch_id":"RM-WRONG","allergens":["peanut"],"declared_at":"2026-01-02T06:00:00Z"}'
 
-step "2. 登记加工批次（EQ-1 共线：先奶制品，后燕麦品）"
+step "2. 登记加工批次（EQ-1 共线：先奶制品，后燕麦品；P2 投入先误登）"
 req POST /processings '{"processing_id":"P1","equipment_id":"EQ-1","start_utc":"2026-01-02T08:00:00Z","end_utc":"2026-01-02T09:00:00Z","inputs":["RM-MILK"],"outputs":["OUT-MILK-1"]}'
-req POST /processings '{"processing_id":"P2","equipment_id":"EQ-1","start_utc":"2026-01-02T10:00:00Z","end_utc":"2026-01-02T11:00:00Z","inputs":["RM-OAT","RM-MYST"],"outputs":["OUT-OAT-1"]}'
+req POST /processings '{"processing_id":"P2","equipment_id":"EQ-1","start_utc":"2026-01-02T10:00:00Z","end_utc":"2026-01-02T11:00:00Z","inputs":["RM-WRONG","RM-MYST"],"outputs":["OUT-OAT-1"]}'
 
-step "3. 溯源 OUT-OAT-1：gluten 来自投入，milk 来自设备残留，pending 来自 RM-MYST"
+step "3. 溯源 OUT-OAT-1：peanut 来自误登投入，milk 来自设备残留，pending 来自 RM-MYST（第 8b 步纠正投入）"
 req GET /batches/OUT-OAT-1/trace
 
 step "4. 登记两次加工之间的已验证清洗 -> 残留被清除"
@@ -52,6 +54,18 @@ step "8. 非法登记示例（均被拒绝且不影响已有数据）"
 req POST /processings '{"processing_id":"P-BAD","equipment_id":"EQ-1","start_utc":"2026-01-02T08:30:00Z","end_utc":"2026-01-02T09:30:00Z","inputs":["RM-OAT"],"outputs":["OUT-X"]}'
 req POST /processings '{"processing_id":"P-LOOP","equipment_id":"EQ-9","start_utc":"2026-01-02T08:00:00Z","end_utc":"2026-01-02T09:00:00Z","inputs":["RM-OAT"],"outputs":["RM-OAT"]}'
 req POST /processings '{"processing_id":"P-TIME","equipment_id":"EQ-9","start_utc":"2026-01-02T09:00:00Z","end_utc":"2026-01-02T08:00:00Z","inputs":["RM-OAT"],"outputs":["OUT-Y"]}'
+
+step "8b. 加工投入纠正：P2 投入误登含 RM-WRONG，整表替换为正确的 RM-OAT + RM-MYST（加工号/设备/时段/产出不变）"
+req POST /processings/P2/inputs/correction '{"inputs":["RM-OAT","RM-MYST"]}'
+step "纠正后 OUT-OAT-1 实时重算：gluten 来自投入、peanut 消失，milk 仍经设备残留，pending 保留"
+req GET /batches/OUT-OAT-1/trace
+step "投入集合未变（顺序不同）：幂等，不产生事件"
+req POST /processings/P2/inputs/correction '{"inputs":["RM-MYST","RM-OAT"]}'
+step "非法纠正（未登记投入 400 / 自环 409 / 空列表 422 / 加工不存在 404）"
+req POST /processings/P2/inputs/correction '{"inputs":["GHOST"]}'
+req POST /processings/P2/inputs/correction '{"inputs":["OUT-OAT-1"]}'
+req POST /processings/P2/inputs/correction '{"inputs":[]}'
+req POST /processings/NOPE/inputs/correction '{"inputs":["RM-OAT"]}'
 
 step "9. 声明更正预演（不落库）：查看差异与已签发标签偏差，取得提交凭据"
 req POST /materials/RM-OAT/declarations/preview '{"allergens":["gluten","sesame","tree-nut"]}'

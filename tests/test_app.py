@@ -41,6 +41,10 @@ def processing(c, pid, eq, start, end, inputs, outputs):
         "inputs": inputs, "outputs": outputs})
 
 
+def correct_inputs(c, pid, inputs):
+    return c.post(f"/processings/{pid}/inputs/correction", json={"inputs": inputs})
+
+
 # ---------------------------------------------------------------- 基础登记与校验
 
 def test_material_and_trace(client):
@@ -313,6 +317,185 @@ def test_label_supersedes_validation(client):
 def test_unknown_batch_404(client):
     assert client.get("/batches/NOPE/trace").status_code == 404
     assert client.post("/batches/NOPE/labels", json={}).status_code == 404
+
+
+# ---------------------------------------------------------------- 加工投入纠正
+
+def test_correct_processing_inputs_recomputes_with_residue(client):
+    # EQ-1: P1(RM-MILK -> OUT-1), P2(RM-WRONG -> OUT-2), P3(RM-X -> OUT-3)
+    material(client, "RM-MILK", allergens=["milk"])
+    material(client, "RM-WRONG", allergens=["sesame"])
+    material(client, "RM-RIGHT", allergens=["gluten"])
+    material(client, "RM-X")
+    assert processing(client, "P1", "EQ-1",
+                      "2026-01-02T08:00:00Z", "2026-01-02T09:00:00Z",
+                      ["RM-MILK"], ["OUT-1"]).status_code == 201
+    assert processing(client, "P2", "EQ-1",
+                      "2026-01-02T10:00:00Z", "2026-01-02T11:00:00Z",
+                      ["RM-WRONG"], ["OUT-2"]).status_code == 201
+    assert processing(client, "P3", "EQ-1",
+                      "2026-01-02T12:00:00Z", "2026-01-02T13:00:00Z",
+                      ["RM-X"], ["OUT-3"]).status_code == 201
+    cursor = _cursor(client)
+
+    # 纠正 P2 的投入：RM-WRONG -> RM-RIGHT；加工号/设备/时段/产出保持原值
+    r = correct_inputs(client, "P2", ["RM-RIGHT"])
+    assert r.status_code == 200, r.text
+    p2 = r.json()
+    assert p2["processing_id"] == "P2"
+    assert p2["equipment_id"] == "EQ-1"
+    assert p2["start_utc"] == "2026-01-02T10:00:00Z"
+    assert p2["end_utc"] == "2026-01-02T11:00:00Z"
+    assert p2["inputs"] == ["RM-RIGHT"]
+    assert p2["outputs"] == ["OUT-2"]
+
+    # OUT-2：sesame 消失、gluten 出现，milk 仍经设备残留来自 OUT-1
+    t2 = client.get("/batches/OUT-2/trace").json()
+    assert t2["allergens"] == ["gluten", "milk"]
+    milk_path = [p for p in t2["allergen_paths"]["milk"]
+                 if p[-1]["via"] == "equipment_residue"][0]
+    assert [s.get("batch_id") for s in milk_path] == ["RM-MILK", "OUT-1", "OUT-2"]
+    gluten_path = t2["allergen_paths"]["gluten"][0]
+    assert [s.get("batch_id") for s in gluten_path] == ["RM-RIGHT", "OUT-2"]
+    assert gluten_path[-1]["via"] == "input"
+    # 依据随纠正更新为 RM-RIGHT 的声明
+    decls = {d["batch_id"] for d in t2["basis"]["material_declarations"]}
+    assert decls == {"RM-MILK", "RM-RIGHT"}
+
+    # OUT-3：后续设备残留传播——sesame 消失，gluten 经 OUT-2 残留进入
+    t3 = client.get("/batches/OUT-3/trace").json()
+    assert t3["allergens"] == ["gluten", "milk"]
+    gpath = [p for p in t3["allergen_paths"]["gluten"]
+             if p[-1]["via"] == "equipment_residue"][0]
+    assert [s.get("batch_id") for s in gpath] == ["RM-RIGHT", "OUT-2", "OUT-3"]
+    assert "sesame" not in t3["allergens"]
+    # OUT-1 与纠正无关，结论不变
+    assert client.get("/batches/OUT-1/trace").json()["allergens"] == ["milk"]
+
+    # 事件：仅实际变化的批次（OUT-2、OUT-3），按批次号排序；op/op_ref 沿用既有字段
+    page = _events(client, cursor)
+    assert [e["batch_id"] for e in page["events"]] == ["OUT-2", "OUT-3"]
+    ev = page["events"][0]
+    assert ev["op"] == "processing_input_correction"
+    assert ev["op_ref"] == {"processing_id": "P2"}
+    assert ev["before"]["conclusion"]["allergens"] == ["milk", "sesame"]
+    assert ev["after"]["conclusion"]["allergens"] == ["gluten", "milk"]
+
+
+def test_correct_inputs_multiple_with_pending_and_residue(client):
+    material(client, "RM-A", allergens=["milk"])
+    material(client, "RM-P", pending=True)
+    material(client, "RM-BLANK")
+    assert processing(client, "P1", "EQ-1",
+                      "2026-01-02T08:00:00Z", "2026-01-02T09:00:00Z",
+                      ["RM-A"], ["OUT-1"]).status_code == 201
+    cursor = _cursor(client)
+    # 多投入纠正（替换为空白原料 + 待确认原料）：待确认经投入传播
+    r = correct_inputs(client, "P1", ["RM-BLANK", "RM-P"])
+    assert r.status_code == 200, r.text
+    assert r.json()["inputs"] == ["RM-BLANK", "RM-P"]
+    t = client.get("/batches/OUT-1/trace").json()
+    assert t["allergens"] == []
+    assert t["pending"] is True
+    via = {s["batch_id"]: s["via"] for s in t["pending_paths"][0]}
+    assert via == {"RM-P": "declaration", "OUT-1": "input"}
+    page = _events(client, cursor)
+    assert [e["batch_id"] for e in page["events"]] == ["OUT-1"]
+
+
+def test_correct_inputs_unchanged_set_produces_no_events(client):
+    material(client, "RM-1", allergens=["milk"])
+    material(client, "RM-2", allergens=["gluten"])
+    assert processing(client, "P1", "EQ-1",
+                      "2026-01-02T08:00:00Z", "2026-01-02T09:00:00Z",
+                      ["RM-1", "RM-2"], ["OUT-1"]).status_code == 201
+    cursor = _cursor(client)
+    # 同集合（顺序不同、含去重）纠正：不替换、不产事件
+    r = correct_inputs(client, "P1", ["RM-2", "RM-1"])
+    assert r.status_code == 200
+    assert r.json()["inputs"] == ["RM-1", "RM-2"]
+    assert _events(client, cursor)["events"] == []
+    assert _cursor(client) == cursor
+
+
+def test_correct_inputs_validation_errors_leave_state_untouched(client):
+    material(client, "RM-MILK", allergens=["milk"])
+    material(client, "RM-OAT", allergens=["gluten"])
+    assert processing(client, "P1", "EQ-1",
+                      "2026-01-02T08:00:00Z", "2026-01-02T09:00:00Z",
+                      ["RM-MILK"], ["OUT-1"]).status_code == 201
+    assert processing(client, "P2", "EQ-2",
+                      "2026-01-02T10:00:00Z", "2026-01-02T11:00:00Z",
+                      ["OUT-1"], ["OUT-2"]).status_code == 201
+
+    # 加工不存在 -> 404
+    assert correct_inputs(client, "NOPE", ["RM-MILK"]).status_code == 404
+    # 下游产出 OUT-2 在 P1 开工后才可用 -> 开工前不可用 400（来源时序上也会成环）
+    r = correct_inputs(client, "P1", ["OUT-2"])
+    assert r.status_code == 400 and "不可用" in r.json()["detail"]
+    # 自环：本加工产出同时作为投入 -> 409（成环检查先于可用性）
+    r = correct_inputs(client, "P1", ["RM-OAT", "OUT-1"])
+    assert r.status_code == 409 and "成环" in r.json()["detail"]
+    # 未登记投入 -> 400
+    r = correct_inputs(client, "P1", ["GHOST"])
+    assert r.status_code == 400
+    # 开工前不可用：RM-LATE 晚于 P1 开始时间登记 -> 400
+    material(client, "RM-LATE", declared_at="2026-01-02T10:30:00Z")
+    r = correct_inputs(client, "P1", ["RM-LATE"])
+    assert r.status_code == 400 and "不可用" in r.json()["detail"]
+    # 非空/无重复（请求级校验）-> 422
+    assert correct_inputs(client, "P1", []).status_code == 422
+    assert correct_inputs(client, "P1", ["RM-MILK", "RM-MILK"]).status_code == 422
+
+    # 全部失败：记录保持原状（投入仍为 RM-MILK），且纠正操作未产生任何事件
+    assert client.get("/processings/P1").json()["inputs"] == ["RM-MILK"]
+    assert client.get("/batches/OUT-1/trace").json()["allergens"] == ["milk"]
+    # 游标推进到 RM-LATE 登记之后（登记事件与本功能无关），其后应为空
+    assert _events(client, _cursor(client))["events"] == []
+
+
+def test_correct_inputs_generic_cycle_detected(client):
+    # 直接落库构造来源边（绕过服务时序校验）：
+    # RM-A --P1--> OUT-1 --P2--> OUT-2；P1 原投入为 RM-A。
+    # 把 P1 投入纠正为 OUT-2（在构造图中 OUT-2 可经 P2 到达，会成环）-> 409。
+    from app import db
+    material(client, "RM-A", allergens=["milk"])
+    conn = db.connect()
+    with db.write_tx(conn):
+        conn.execute("INSERT INTO processings VALUES ('P1','EQ-1',"
+                     "'2026-01-02T08:00:00+00:00','2026-01-02T09:00:00+00:00')")
+        conn.execute("INSERT INTO processings VALUES ('P2','EQ-2',"
+                     "'2026-01-02T06:00:00+00:00','2026-01-02T07:00:00+00:00')")
+        conn.execute("INSERT INTO processing_inputs VALUES ('P1','RM-A')")
+        conn.execute("INSERT INTO processing_outputs VALUES ('P1','OUT-1')")
+        conn.execute("INSERT INTO processing_inputs VALUES ('P2','OUT-1')")
+        conn.execute("INSERT INTO processing_outputs VALUES ('P2','OUT-2')")
+    conn.close()
+    # OUT-2 的“可用时间”被构造成 07:00（早于 P1 开始），通过可用性后由成环检查拦截
+    r = correct_inputs(client, "P1", ["OUT-2"])
+    assert r.status_code == 409 and "成环" in r.json()["detail"]
+    # 记录保持原状
+    assert client.get("/processings/P1").json()["inputs"] == ["RM-A"]
+
+
+def test_correct_inputs_keeps_issued_label_snapshot(client):
+    material(client, "RM-MILK", allergens=["milk"])
+    material(client, "RM-WRONG", allergens=["sesame"])
+    material(client, "RM-RIGHT", allergens=["gluten"])
+    assert processing(client, "P1", "EQ-1",
+                      "2026-01-02T08:00:00Z", "2026-01-02T09:00:00Z",
+                      ["RM-WRONG"], ["OUT-1"]).status_code == 201
+    label = client.post("/batches/OUT-1/labels", json={}).json()
+    # 纠正投入：sesame -> gluten（实时结论改变）
+    assert correct_inputs(client, "P1", ["RM-RIGHT"]).status_code == 200
+    assert client.get("/batches/OUT-1/trace").json()["allergens"] == ["gluten"]
+    # 已签发标签保留原快照
+    frozen = client.get(f"/labels/{label['label_id']}").json()
+    assert frozen["conclusion"]["allergens"] == ["sesame"]
+    # 纠正后签发的新标签反映新实时结论
+    label2 = client.post("/batches/OUT-1/labels",
+                         json={"supersedes_id": label["label_id"]}).json()
+    assert label2["conclusion"]["allergens"] == ["gluten"]
 
 
 # ---------------------------------------------------------------- 预演与凭据提交

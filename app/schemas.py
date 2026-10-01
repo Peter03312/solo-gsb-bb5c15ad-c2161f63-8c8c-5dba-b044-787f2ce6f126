@@ -35,6 +35,16 @@ class DeclarationCreate(BaseModel):
         return _clean_allergens(v)
 
 
+def _clean_batch_refs(values: list[str]) -> list[str]:
+    """批次引用列表：去空白、去空项；空列表或含重复项一律拒绝。"""
+    ids = [x.strip() for x in values if x and x.strip()]
+    if len(ids) != len(set(ids)):
+        raise ValueError("批次号重复")
+    if not ids:
+        raise ValueError("不能为空")
+    return ids
+
+
 class ProcessingCreate(BaseModel):
     processing_id: str = Field(min_length=1)
     equipment_id: str = Field(min_length=1)
@@ -46,12 +56,18 @@ class ProcessingCreate(BaseModel):
     @field_validator("inputs", "outputs")
     @classmethod
     def _v_batches(cls, v):
-        ids = [x.strip() for x in v if x and x.strip()]
-        if len(ids) != len(set(ids)):
-            raise ValueError("批次号重复")
-        if not ids:
-            raise ValueError("不能为空")
-        return ids
+        return _clean_batch_refs(v)
+
+
+class ProcessingInputCorrectionCreate(BaseModel):
+    """加工投入纠正：完整的正确投入列表（整表替换，非增量补丁）。"""
+
+    inputs: list[str] = Field(min_length=1)
+
+    @field_validator("inputs")
+    @classmethod
+    def _v_inputs(cls, v):
+        return _clean_batch_refs(v)
 
 
 class CleaningCreate(BaseModel):

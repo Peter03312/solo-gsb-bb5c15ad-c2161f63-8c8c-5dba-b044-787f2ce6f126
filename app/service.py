@@ -239,12 +239,19 @@ def create_processing(conn: sqlite3.Connection, data) -> dict:
     return get_processing(conn, data.processing_id)
 
 
-def _check_no_cycle(conn, inputs: list[str], outputs: list[str]) -> None:
+def _check_no_cycle(conn, inputs: list[str], outputs: list[str],
+                    ignore_processing: str | None = None) -> None:
     """通用成环检查：在现有“投入->产出”批次图上，若任一新产出可到达任一投入，
-    则新增边会成环，拒绝。（产出为全新批次时该检查恒通过，作为防御保留。）"""
+    则新增/替换后的边会成环，拒绝。（产出为全新批次时该检查恒通过，作为防御保留。）
+
+    ignore_processing：加工投入纠正时传入被纠正加工号——构边时排除该加工的
+    旧投入边（这些边即将被整表替换，不应参与成环判定）。
+    """
     adj: dict[str, list[str]] = {}
     for p in conn.execute("SELECT processing_id FROM processings"):
         pid = p["processing_id"]
+        if pid == ignore_processing:
+            continue
         ins = [r["batch_id"] for r in conn.execute(
             "SELECT batch_id FROM processing_inputs WHERE processing_id = ?", (pid,))]
         outs = [r["batch_id"] for r in conn.execute(
@@ -289,6 +296,75 @@ def get_processing(conn: sqlite3.Connection, processing_id: str) -> dict:
 def list_processings(conn: sqlite3.Connection) -> list[dict]:
     rows = conn.execute("SELECT processing_id FROM processings ORDER BY start_utc").fetchall()
     return [get_processing(conn, r["processing_id"]) for r in rows]
+
+
+# ---------------------------------------------------------------- 加工投入纠正
+
+def correct_processing_inputs(conn: sqlite3.Connection, processing_id: str,
+                              data) -> dict:
+    """纠正已登记加工的投入列表（整表替换）。
+
+    原加工号、设备、起止时段与产出批次保持原值；新投入须非空、无重复、
+    均已登记且在加工开始前可用，替换后的来源关系不得成环。校验与替换在同一
+    写事务内完成，随后按现有规则重算全部相关批次的实时结论（过敏原/待确认/
+    来源路径/依据，含后续设备残留传播）并仅为实际变化的批次按批次号顺序
+    记录事件；投入集合未变时不替换、不产事件。已签发标签快照不受影响。
+    """
+    new_inputs = list(data.inputs)
+    with write_tx(conn):
+        proc = conn.execute(
+            "SELECT * FROM processings WHERE processing_id = ?", (processing_id,)
+        ).fetchone()
+        if not proc:
+            raise NotFound(f"未知加工批次: {processing_id}")
+
+        start = from_store(proc["start_utc"])
+        outputs = [r["batch_id"] for r in conn.execute(
+            "SELECT batch_id FROM processing_outputs WHERE processing_id = ?",
+            (processing_id,))]
+        old_inputs = [r["batch_id"] for r in conn.execute(
+            "SELECT batch_id FROM processing_inputs WHERE processing_id = ?",
+            (processing_id,))]
+
+        # 投入集合（多重集合）未变 -> 幂等返回，不替换、不产事件
+        if sorted(old_inputs) == sorted(new_inputs):
+            return get_processing(conn, processing_id)
+
+        # 1) 自环：本加工产出不得同时是新投入
+        loop = set(new_inputs) & set(outputs)
+        if loop:
+            raise Conflict(f"批次来源成环：{sorted(loop)} 既是投入又是产出")
+
+        # 2) 新投入必须已登记且在加工开始前可用（设备/时段不变，沿用原开始时间）
+        for in_id in new_inputs:
+            try:
+                avail = _available_at(conn, in_id)
+            except NotFound:
+                raise BadRequest(f"投入批次 {in_id} 不存在")
+            if avail > start:
+                raise BadRequest(
+                    f"投入批次 {in_id} 在加工开始前不可用"
+                    f"（可用时间 {iso_z(to_store(avail))} 晚于开始时间 {proc['start_utc']}）"
+                )
+
+        # 3) 通用成环检查：排除本加工的旧投入边（即将被替换），
+        #    校验“替换后”的来源图中本加工产出不可到达任一新投入
+        _check_no_cycle(conn, new_inputs, outputs, ignore_processing=processing_id)
+
+        # 校验通过：替换投入（原加工号/设备/时段/产出保持原值）
+        before_views = _snapshot_views(conn)
+        conn.execute(
+            "DELETE FROM processing_inputs WHERE processing_id = ?", (processing_id,))
+        for in_id in new_inputs:
+            conn.execute(
+                "INSERT INTO processing_inputs (processing_id, batch_id) VALUES (?, ?)",
+                (processing_id, in_id),
+            )
+        # 全量重算对比：仅为结论/来源路径/依据实际变化的批次按批次号顺序落事件，
+        # 设备残留沿后续加工继续传播的批次同样自动计入。
+        _record_events(conn, "processing_input_correction",
+                       {"processing_id": processing_id}, before_views)
+    return get_processing(conn, processing_id)
 
 
 # ---------------------------------------------------------------- 清洗

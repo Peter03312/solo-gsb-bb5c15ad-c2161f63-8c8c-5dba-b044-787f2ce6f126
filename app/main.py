@@ -16,6 +16,7 @@ from .schemas import (
     LabelCreate,
     MaterialCreate,
     ProcessingCreate,
+    ProcessingInputCorrectionCreate,
 )
 
 
@@ -27,10 +28,10 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="过敏原溯源服务",
-    version="1.2.0",
+    version="1.3.0",
     description="共线生产食品批次的过敏原与待确认状态溯源：原料声明、加工登记、"
-                "设备残留与清洗、来源路径查询、标签签发，声明更正/清洗撤销的"
-                "预演与凭据提交，以及面向下游的游标增量变更事件订阅。",
+                "加工投入纠正、设备残留与清洗、来源路径查询、标签签发，"
+                "声明更正/清洗撤销的预演与凭据提交，以及面向下游的游标增量变更事件订阅。",
     lifespan=lifespan,
 )
 
@@ -117,6 +118,21 @@ def list_processings(conn=Depends(get_conn)):
 @app.get("/processings/{processing_id}", tags=["加工"])
 def get_processing(processing_id: str, conn=Depends(get_conn)):
     return service.get_processing(conn, processing_id)
+
+
+@app.post("/processings/{processing_id}/inputs/correction", tags=["加工"])
+def correct_processing_inputs(processing_id: str,
+                              data: ProcessingInputCorrectionCreate,
+                              conn=Depends(get_conn)):
+    """纠正加工的投入批次登记（整表替换为完整正确投入列表）。
+
+    原加工号、设备、起止时段、产出批次保持原值；投入须非空、无重复、已登记且
+    在开工前可用，纠正后的来源关系不得成环。校验与替换在同一事务内完成，
+    随后按现有规则重算相关批次实时结论（含后续设备残留传播）；投入集合未变
+    不产事件，已签发标签保留原快照。加工不存在返回 404，校验失败返回
+    400/409，记录与事件均保持原状。
+    """
+    return service.correct_processing_inputs(conn, processing_id, data)
 
 
 # ---------------------------------------------------------------- 清洗

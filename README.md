@@ -4,6 +4,8 @@
 
 - 登记**原料批次**的过敏原集合或**待确认**状态（声明可更正，保留版本历史）；
 - 登记**加工批次**：设备、UTC 起止时间、投入批次、产出批次；
+  已登记加工的**投入登记错误可纠正**（整表替换投入列表，加工号/设备/时段/产出不变，
+  同事务校验、随后按现有规则实时重算并仅为实际变化批次记录事件）；
 - 产出继承投入的过敏原/待确认状态，并继承**设备上一次加工的残留**；
   只有两次加工之间**已验证且未撤销**的清洗才清除残留；
 - 查询任一批次，返回**每项过敏原与待确认状态的来源路径**及当前有效依据；
@@ -83,6 +85,7 @@ pytest tests/ -q
 | POST | `/materials/{batch_id}/declarations` | 更正声明（追加新版本） |
 | POST | `/materials/{batch_id}/declarations/preview` | 声明更正预演（不落库），返回差异报告 + 提交凭据 |
 | POST | `/processings` | 登记加工批次（含全部校验） |
+| POST | `/processings/{id}/inputs/correction` | 纠正加工投入（整表替换，加工号/设备/时段/产出不变） |
 | GET | `/processings` / `/processings/{id}` | 查询加工批次 |
 | POST | `/cleanings` | 登记设备清洗（`verified` 标记是否已验证） |
 | GET | `/cleanings` / `/cleanings/{id}` | 查询清洗记录（可按 `?equipment_id=` 过滤） |
@@ -143,6 +146,50 @@ curl -s $BASE/cleanings/1/revoke/preview -X POST
 curl -s $BASE/previews/<preview_id>/commit -X POST
 ```
 
+## 加工投入纠正
+
+加工已登记后若发现**投入批次登记错误**，可用加工号 + **完整的正确投入列表**
+纠正记录：
+
+```
+POST /processings/{processing_id}/inputs/correction
+{"inputs": ["RM-A", "RM-B"]}
+```
+
+规则：
+
+- 请求体为**整表替换**（不是增量补丁），须提交完整的正确投入列表；
+- **原加工号、设备、起止时段、产出批次保持原值**，只替换投入边；
+- 投入须**非空、无重复、均已登记且在加工开始前可用**（可用时间口径与登记一致：
+  原料=首次登记时间，加工产出=产出加工结束时间）；纠正后的来源关系**不得成环**
+  （本加工产出不得是新投入，且其下游不得间接到达任一新投入）；
+- **校验与替换在同一 `BEGIN IMMEDIATE` 事务内完成**，任一校验失败即回滚，
+  记录与事件均保持原状；加工号不存在返回 `404`，未登记/开工前不可用 `400`，
+  成环 `409`，空列表/重复 `422`；
+- 替换后按现有规则**实时重算相关批次**的过敏原、待确认状态、来源路径与依据，
+  包括沿同设备**后续加工的残留传播**；已签发标签**保留原快照**不受影响；
+- 变更沿用既有变更订阅事件的字段与全局递增序号：`op` =
+  `processing_input_correction`，`op_ref` = `{"processing_id": "..."}`，
+  同次纠错**仅为实际变化的批次按批次号顺序**记录事件（固定上界分页等约定不变）；
+  **投入集合未变时不替换、不产生事件**（按集合比较，顺序不同视为未变）。
+
+```bash
+BASE=http://localhost:8000
+
+# 纠正 P2 的投入（原误登为 RM-MILK，实际为 RM-OAT）；设备/时段/产出不变
+curl -s $BASE/processings/P2/inputs/correction -X POST \
+  -H 'Content-Type: application/json' \
+  -d '{"inputs": ["RM-OAT"]}'
+
+# 多投入的完整正确列表
+curl -s $BASE/processings/P2/inputs/correction -X POST \
+  -H 'Content-Type: application/json' \
+  -d '{"inputs": ["RM-OAT", "RM-SOY"]}'
+
+# 实时溯源随之重算（含后续设备残留下游）；已签发标签仍是签发时快照
+curl -s $BASE/batches/OUT-OAT-1/trace
+```
+
 ## 变更事件订阅（游标增量同步）
 
 下游系统按“**初始化快照 + 游标增量事件**”两阶段同步溯源变化：
@@ -173,7 +220,8 @@ curl -s $BASE/previews/<preview_id>/commit -X POST
 
 - **触发操作**（`op`）：`material_register`（原料登记）、`declaration_correction`
   （原料更正，含预演提交，`op_ref.via` 区分 `direct` / `preview_commit`）、
-  `processing_register`（加工登记）、`cleaning_register`（清洗登记）、
+  `processing_register`（加工登记）、`processing_input_correction`（加工投入纠正，
+  `op_ref` 为 `{"processing_id": ...}`）、`cleaning_register`（清洗登记）、
   `cleaning_revocation`（清洗撤销，含预演提交）。
 - **新批次**（原料登记、加工产出）`before` 为 `null`（前态为空）。
 - 仅为**结论、来源路径或依据确有变化**的批次生成事件；同次操作的多条事件
@@ -276,7 +324,7 @@ app/
   service.py   # 业务规则：校验、溯源计算、标签签发、变更预演、变更事件流
   db.py        # SQLite 连接、建表、写/读事务
   schemas.py   # 请求模型（强制时区感知时间）
-tests/test_app.py   # 39 个端到端测试
+tests/test_app.py   # 45 个端到端测试
 examples/demo.sh    # 全流程 curl 演示（含变更订阅）
 Dockerfile / docker-compose.yml / requirements*.txt
 ```
