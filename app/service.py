@@ -239,24 +239,35 @@ def create_processing(conn: sqlite3.Connection, data) -> dict:
     return get_processing(conn, data.processing_id)
 
 
-def _check_no_cycle(conn, inputs: list[str], outputs: list[str]) -> None:
-    """通用成环检查：在现有“投入->产出”批次图上，若任一新产出可到达任一投入，
-    则新增边会成环，拒绝。（产出为全新批次时该检查恒通过，作为防御保留。）"""
+def _check_no_cycle(conn, inputs: list[str], outputs: list[str],
+                    replace_processing: str | None = None) -> None:
+    """通用成环检查：在“投入->产出”批次图上，若任一新产出可到达任一投入，
+    则新增/替换的边会成环，拒绝。（产出为全新批次时该检查恒通过，作为防御保留。）
+
+    replace_processing 非空时用于“投入纠正”：构图先剔除该加工现有的投入边，
+    再以给定 inputs/outputs 作为该加工的边，检查纠正后的图是否成环。
+    """
     adj: dict[str, list[str]] = {}
     for p in conn.execute("SELECT processing_id FROM processings"):
         pid = p["processing_id"]
+        if pid == replace_processing:
+            continue
         ins = [r["batch_id"] for r in conn.execute(
             "SELECT batch_id FROM processing_inputs WHERE processing_id = ?", (pid,))]
         outs = [r["batch_id"] for r in conn.execute(
             "SELECT batch_id FROM processing_outputs WHERE processing_id = ?", (pid,))]
         for i in ins:
             adj.setdefault(i, []).extend(outs)
+    for i in inputs:
+        adj.setdefault(i, []).extend(outputs)
     targets = set(inputs)
     for o in outputs:
         stack, seen = [o], set()
         while stack:
             node = stack.pop()
             if node in targets:
+                if node == o:
+                    raise Conflict(f"批次来源成环：{o} 既是投入又是产出")
                 raise Conflict(f"批次来源成环：产出 {o} 是投入 {node} 的上游")
             if node in seen:
                 continue
@@ -289,6 +300,75 @@ def get_processing(conn: sqlite3.Connection, processing_id: str) -> dict:
 def list_processings(conn: sqlite3.Connection) -> list[dict]:
     rows = conn.execute("SELECT processing_id FROM processings ORDER BY start_utc").fetchall()
     return [get_processing(conn, r["processing_id"]) for r in rows]
+
+
+# ---------------------------------------------------------------- 加工投入纠正
+
+def correct_processing_inputs(conn: sqlite3.Connection, processing_id: str,
+                              data) -> dict:
+    """纠正某次加工的投入批次登记：以完整的正确投入列表整体替换原投入。
+
+    原加工号、设备、起止时段与产出批次保持原值；校验与替换在同一事务内完成，
+    随后按现有规则重算相关批次实时结论（含后续设备残留传播）并记录变更事件。
+    投入集合未变时不写入、不产生事件。
+    """
+    with write_tx(conn):
+        proc = conn.execute(
+            "SELECT * FROM processings WHERE processing_id = ?", (processing_id,)
+        ).fetchone()
+        if not proc:
+            raise NotFound(f"未知加工批次: {processing_id}")
+        start = from_store(proc["start_utc"])
+        outputs = [r["batch_id"] for r in conn.execute(
+            "SELECT batch_id FROM processing_outputs WHERE processing_id = ?",
+            (processing_id,))]
+        old_inputs = [r["batch_id"] for r in conn.execute(
+            "SELECT batch_id FROM processing_inputs WHERE processing_id = ?"
+            " ORDER BY batch_id",
+            (processing_id,))]
+        new_inputs = list(data.inputs)
+
+        # 1) 来源不得成环：先剔除本加工现有边，再以新投入构图做可达性检查
+        loop = set(new_inputs) & set(outputs)
+        if loop:
+            raise Conflict(f"批次来源成环：{sorted(loop)} 既是投入又是产出")
+        _check_no_cycle(conn, new_inputs, outputs, replace_processing=processing_id)
+
+        # 2) 投入必须已登记且在开工前可用（设备/时段不变，沿用原 start_utc）
+        for in_id in new_inputs:
+            try:
+                avail = _available_at(conn, in_id)
+            except NotFound:
+                raise BadRequest(f"投入批次 {in_id} 不存在")
+            if avail > start:
+                raise BadRequest(
+                    f"投入批次 {in_id} 在加工开始前不可用"
+                    f"（可用时间 {iso_z(to_store(avail))} 晚于开始时间 {proc['start_utc']}）"
+                )
+
+        # 3) 投入集合未变：不写入、不产生事件，记录与事件均保持原状
+        unchanged = set(old_inputs) == set(new_inputs)
+        changed_batches: list[str] = []
+        if not unchanged:
+            before_views = _snapshot_views(conn)
+            conn.execute(
+                "DELETE FROM processing_inputs WHERE processing_id = ?",
+                (processing_id,))
+            for in_id in new_inputs:
+                conn.execute(
+                    "INSERT INTO processing_inputs (processing_id, batch_id)"
+                    " VALUES (?, ?)",
+                    (processing_id, in_id),
+                )
+            changed_batches = _record_events(
+                conn, "processing_input_correction",
+                {"processing_id": processing_id}, before_views)
+
+        result = get_processing(conn, processing_id)
+        result["corrected"] = not unchanged
+        result["previous_inputs"] = old_inputs
+        result["changed_batches"] = changed_batches
+        return result
 
 
 # ---------------------------------------------------------------- 清洗

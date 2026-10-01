@@ -4,6 +4,8 @@
 
 - 登记**原料批次**的过敏原集合或**待确认**状态（声明可更正，保留版本历史）；
 - 登记**加工批次**：设备、UTC 起止时间、投入批次、产出批次；
+  投入登记有误时可用**加工号 + 完整正确投入列表纠正**（加工号、设备、时段、
+  产出批次不变），纠正与校验同事务，随后实时重算并记录变更事件；
 - 产出继承投入的过敏原/待确认状态，并继承**设备上一次加工的残留**；
   只有两次加工之间**已验证且未撤销**的清洗才清除残留；
 - 查询任一批次，返回**每项过敏原与待确认状态的来源路径**及当前有效依据；
@@ -83,6 +85,7 @@ pytest tests/ -q
 | POST | `/materials/{batch_id}/declarations` | 更正声明（追加新版本） |
 | POST | `/materials/{batch_id}/declarations/preview` | 声明更正预演（不落库），返回差异报告 + 提交凭据 |
 | POST | `/processings` | 登记加工批次（含全部校验） |
+| POST | `/processings/{id}/inputs/correction` | 纠正加工投入登记（整体替换投入列表，其余字段保持原值） |
 | GET | `/processings` / `/processings/{id}` | 查询加工批次 |
 | POST | `/cleanings` | 登记设备清洗（`verified` 标记是否已验证） |
 | GET | `/cleanings` / `/cleanings/{id}` | 查询清洗记录（可按 `?equipment_id=` 过滤） |
@@ -173,7 +176,8 @@ curl -s $BASE/previews/<preview_id>/commit -X POST
 
 - **触发操作**（`op`）：`material_register`（原料登记）、`declaration_correction`
   （原料更正，含预演提交，`op_ref.via` 区分 `direct` / `preview_commit`）、
-  `processing_register`（加工登记）、`cleaning_register`（清洗登记）、
+  `processing_register`（加工登记）、`processing_input_correction`（加工投入纠正）、
+  `cleaning_register`（清洗登记）、
   `cleaning_revocation`（清洗撤销，含预演提交）。
 - **新批次**（原料登记、加工产出）`before` 为 `null`（前态为空）。
 - 仅为**结论、来源路径或依据确有变化**的批次生成事件；同次操作的多条事件
@@ -266,6 +270,59 @@ curl -s $BASE/batches/OUT-OAT-1/labels -X POST \
 curl -s $BASE/batches/OUT-OAT-1/labels -X POST \
   -H 'Content-Type: application/json' -d '{"supersedes_id": 1}'
 curl -s $BASE/labels/1   # 旧标签保持签发时的结论不变
+
+# 8. 加工投入登记有误：用加工号 + 完整正确投入列表纠正
+#    （加工号/设备/时段/产出不变；下游结论与设备残留实时重算，事件按批次号记录）
+curl -s $BASE/processings/P1/inputs/correction -X POST \
+  -H 'Content-Type: application/json' -d '{"inputs": ["RM-MILK", "RM-OAT"]}'
+```
+
+## 加工投入纠正
+
+生产台账发现某次加工的**投入批次登记有误**时，可用加工号 + **完整的正确投入
+列表**纠正记录：
+
+```bash
+curl -s $BASE/processings/P1/inputs/correction -X POST \
+  -H 'Content-Type: application/json' \
+  -d '{"inputs": ["RM-MILK", "RM-OAT"]}'
+```
+
+规则：
+
+- **整体替换**：请求体即纠正后的完整投入集合；原**加工号、设备、起止时段、
+  产出批次**保持原值不变。
+- **校验（与替换同一事务，失败即回滚、记录与事件均保持原状）**：
+  - 投入列表**非空、无重复**（请求格式不合法返回 `422`）；
+  - 每个投入批次**已登记**且在**开工前可用**（原料可用时间=首次登记时间，
+    产出可用时间=产出加工结束时间），否则 `400`；
+  - 纠正后的来源关系**不得成环**（含自环与下游反向回流），否则 `409`；
+  - 加工号不存在返回 `404`。
+- 设备、时段不变，因此不重新校验设备重叠；既有清洗窗口、后续加工均按原时段
+  继续适用。
+- 校验通过后按现有规则重算相关批次的**实时过敏原、待确认状态、来源路径与
+  依据**，包括同设备**后续加工的残留传播**（链路上已验证未撤销的清洗照常
+  隔断残留）；**已签发标签保留原快照**不变。
+- 事件沿用现有订阅字段与全局序号（`op = "processing_input_correction"`，
+  `op_ref = {"processing_id": ...}`），同次纠错**仅为实际变化的批次**（结论、
+  路径或依据变化）按**批次号顺序**记录，固定上界分页规则不变。
+- **投入集合未变**（与原集合相同，忽略顺序）时不写入、`corrected=false`、
+  **不产生事件**。
+
+响应在加工对象字段之外附带纠正信息：
+
+```json
+{
+  "processing_id": "P1",
+  "equipment_id": "EQ-1",
+  "start_utc": "2026-01-02T08:00:00Z",
+  "end_utc": "2026-01-02T09:00:00Z",
+  "inputs": ["RM-MILK", "RM-OAT"],
+  "outputs": ["OUT-1"],
+  "corrected": true,
+  "previous_inputs": ["RM-A"],
+  "changed_batches": ["OUT-1", "OUT-2"]
+}
 ```
 
 ## 项目结构
@@ -276,7 +333,7 @@ app/
   service.py   # 业务规则：校验、溯源计算、标签签发、变更预演、变更事件流
   db.py        # SQLite 连接、建表、写/读事务
   schemas.py   # 请求模型（强制时区感知时间）
-tests/test_app.py   # 39 个端到端测试
+tests/test_app.py   # 51 个端到端测试
 examples/demo.sh    # 全流程 curl 演示（含变更订阅）
 Dockerfile / docker-compose.yml / requirements*.txt
 ```

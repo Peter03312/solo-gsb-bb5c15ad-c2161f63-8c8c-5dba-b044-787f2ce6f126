@@ -71,7 +71,22 @@ req GET /labels/1
 step "凭据一次性：再次提交将被拒绝"
 req POST "/previews/$PID/commit"
 
-step "12. 变更订阅：初始化读取（现存批次实时结论 + 游标，同一状态）"
+step "12. 加工投入纠正：用加工号 + 完整正确投入列表整体替换 P1 的投入"
+# P1 原投入仅 RM-MILK；纠正为 RM-MILK + RM-OAT（加工号/设备/时段/产出均不变）
+req POST /processings/P1/inputs/correction '{"inputs":["RM-MILK","RM-OAT"]}'
+step "下游实时重算：OUT-MILK-1 新增 gluten 投入继承；已签发标签仍是原快照"
+req GET /batches/OUT-MILK-1/trace
+req GET /labels/1
+step "投入集合未变（仅顺序不同）：corrected=false、changed_batches 为空、不产事件"
+req POST /processings/P1/inputs/correction '{"inputs":["RM-OAT","RM-MILK"]}'
+step "校验失败示例：加工不存在 404 / 未知投入 400 / 自环成环 409（记录与事件保持原状）"
+req POST /processings/P-NOPE/inputs/correction '{"inputs":["RM-MILK"]}'
+req POST /processings/P1/inputs/correction '{"inputs":["GHOST"]}'
+req POST /processings/P1/inputs/correction '{"inputs":["OUT-MILK-1"]}'
+step "纠正回原投入，恢复台账（同次纠错事件仅含实际变化批次且按批次号排序）"
+req POST /processings/P1/inputs/correction '{"inputs":["RM-MILK"]}'
+
+step "13. 变更订阅：初始化读取（现存批次实时结论 + 游标，同一状态）"
 SNAP="$(curl -sS "$BASE/changes/snapshot")"
 echo "$SNAP" | python3 -c 'import sys,json; d=json.load(sys.stdin)
 print("cursor =", d["cursor"])
@@ -81,11 +96,11 @@ for b in d["batches"]:
           "allergens =", c["allergens"], "pending =", c["pending"])'
 CURSOR="$(echo "$SNAP" | python3 -c 'import sys,json;print(json.load(sys.stdin)["cursor"])')"
 
-step "13. 触发一次变更（声明更正），按游标增量读取事件"
+step "14. 触发一次变更（声明更正），按游标增量读取事件"
 req POST /materials/RM-OAT/declarations '{"allergens":["gluten","sesame","soy","mustard"]}'
 req GET "/changes/events?cursor=$CURSOR&limit=10"
 
-step "14. 分页读取：固定上界 upper，翻页期间的新写入不进入本次读取"
+step "15. 分页读取：固定上界 upper，翻页期间的新写入不进入本次读取"
 PAGE1="$(curl -sS "$BASE/changes/events?cursor=0&limit=2")"
 echo "$PAGE1" | python3 -c 'import sys,json; d=json.load(sys.stdin)
 print("page1:", [(e["seq"], e["batch_id"]) for e in d["events"]], "next_cursor =", d["next_cursor"], "upper =", d["upper"])'

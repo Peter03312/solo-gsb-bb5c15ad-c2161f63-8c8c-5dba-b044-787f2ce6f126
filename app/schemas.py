@@ -46,12 +46,27 @@ class ProcessingCreate(BaseModel):
     @field_validator("inputs", "outputs")
     @classmethod
     def _v_batches(cls, v):
-        ids = [x.strip() for x in v if x and x.strip()]
-        if len(ids) != len(set(ids)):
-            raise ValueError("批次号重复")
-        if not ids:
-            raise ValueError("不能为空")
-        return ids
+        return _batch_list(v)
+
+
+def _batch_list(v: list[str]) -> list[str]:
+    ids = [x.strip() for x in v if x and x.strip()]
+    if len(ids) != len(set(ids)):
+        raise ValueError("批次号重复")
+    if not ids:
+        raise ValueError("不能为空")
+    return ids
+
+
+class ProcessingInputCorrection(BaseModel):
+    """加工投入纠正：以完整的正确投入列表整体替换原投入（须非空、无重复）。"""
+
+    inputs: list[str] = Field(min_length=1)
+
+    @field_validator("inputs")
+    @classmethod
+    def _v_batches(cls, v):
+        return _batch_list(v)
 
 
 class CleaningCreate(BaseModel):
